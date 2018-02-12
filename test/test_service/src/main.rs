@@ -1,4 +1,10 @@
 
+use std::thread;
+
+extern crate futures;
+use futures::prelude::*;
+use futures::sync::mpsc::channel;
+
 extern crate serco;
 extern crate serde;
 extern crate serco_mpsc;
@@ -26,20 +32,24 @@ fn main() {
 
     // THe MPSC service uses external channels.
     // Normal services will deal with the communcation over network stacks etc.
-    let ( server_tx, client_rx ) = std::sync::mpsc::channel();
-    let ( client_tx, server_rx ) = std::sync::mpsc::channel();
-
-    // Host the service.
-    let endpoint = MpscServiceEndpoint::<MyService>::open(
-            server_rx, server_tx, MyServiceImplementation );
+    let (tx, rx) = channel(1);
 
     // Connect to the service.
-    let client = MpscServiceConnection::<MyService>::connect(
-            client_rx, client_tx );
+    let client = MpscServiceConnection::<MyService>::connect(tx);
+
+    let t = thread::spawn( move || {
+        // Host the service.
+        MpscServiceEndpoint::<MyService>::run(
+                rx, MyServiceImplementation );
+    } );
 
     // Call the service.
     println!( "{}", client.foo( 2 ) );
     println!( "{}", client.foo( 3 ) );
+
+    // Close the service.
+    client.close();
+    t.join().expect( "Failed to join thread" );
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -56,13 +66,14 @@ impl serco::ServiceContract for MyService {
 
     fn invoke<'de, D, S>(
         &self,
-        name : &str,
+        name: &str,
         params : D,
-        output : S
-    ) -> Result<(), ()>
+        mut output : S
+    ) -> Box<Future<Item=S, Error=serco::ServiceError>>
         where
             D: Deserializer<'de>,
-            S: Serializer,
+            S: 'static,
+            for <'a> &'a mut S: Serializer
     {
         match name {
             "foo" => {
@@ -72,13 +83,23 @@ impl serco::ServiceContract for MyService {
                 }
 
                 let params = Params::deserialize(params).unwrap();
-                let result = self.foo( params.a );
+                let rval = self.foo( params.a );
 
-                result.serialize( output )
-                        .map( |_| () )
-                        .map_err( |_| () )
+                if let Err(e) = rval.serialize( &mut output ) {
+                    return Box::new(
+                        Err( serco::ServiceError::from(e) ).into_future()
+                    );
+                }
+
+                Box::new( Ok( output ).into_future() )
+                /*
+                Box::new( match result {
+                    Ok(_) => Ok( output ),
+                    Err(_) => Err( serco::ServiceError::UnknownError ),
+                }.into_future() )
+                */
             }
-            _ => Err(())
+            _ => Box::new( futures::future::err( serco::ServiceError::from( "Bad fn" ) ) )
         }
     }
 }
@@ -97,7 +118,7 @@ impl<F: serco::Forwarder> MyService for serco::ServiceProxy<MyService, F> {
 
         let params = Params { a };
         let result = self.forwarder.forward( "foo", params );
-        result.unwrap()
+        result.wait().unwrap()
     }
 }
 
@@ -107,13 +128,14 @@ impl serco::Service<MyService> for MyServiceImplementation {
 
     fn invoke<'de, D, S>(
         &self,
-        name : &str,
+        name: &str,
         params : D,
         output : S
-    ) -> Result<(), ()>
+    ) -> Box<Future<Item=S, Error=serco::ServiceError>>
         where
             D: Deserializer<'de>,
-            S: Serializer,
+            S: 'static,
+            for <'a> &'a mut S: Serializer
     {
         ( self as &MyService ).invoke( name, params, output )
     }

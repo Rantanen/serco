@@ -1,4 +1,7 @@
 
+extern crate futures;
+use futures::prelude::*;
+
 extern crate serde;
 use serde::{Serializer, Serialize, Deserializer};
 use serde::de::DeserializeOwned;
@@ -7,6 +10,15 @@ use serde::de::DeserializeOwned;
 #[macro_use] extern crate serde_json;
 #[cfg(test)]
 #[macro_use] extern crate serde_derive;
+
+#[derive(Debug)]
+pub struct ServiceError(pub String);
+impl ServiceError {
+    pub fn from<T: std::fmt::Debug>( src: T ) -> ServiceError
+    {
+        ServiceError( format!( "{:?}", src ) )
+    }
+}
 
 /// A service contract that is callable through dynamic messages.
 ///
@@ -18,10 +30,11 @@ pub trait ServiceContract {
         name: &str,
         params : D,
         output : S
-    ) -> Result<(), ()>
+    ) -> Box<Future<Item=S, Error=ServiceError>>
         where
             D: Deserializer<'de>,
-            S: Serializer;
+            S: 'static,
+            for <'a> &'a mut S: Serializer;
 }
 
 /// An implementation for the service contract `TContract`.
@@ -45,10 +58,11 @@ pub trait Service<TContract: ServiceContract + ?Sized + 'static> {
         name: &str,
         params : D,
         output : S
-    ) -> Result<(), ()>
+    ) -> Box<Future<Item=S, Error=ServiceError>>
         where
             D: Deserializer<'de>,
-            S: Serializer;
+            S: 'static,
+            for <'a> &'a mut S: Serializer;
 }
 
 /// A service forwarder used by the proxy implementation.
@@ -60,14 +74,16 @@ pub trait Service<TContract: ServiceContract + ?Sized + 'static> {
 /// Defined by the concrete service host.
 pub trait Forwarder {
 
-    fn forward<'de, D, S>(
+    fn forward<D, S>(
         &self,
-        name: &str,
+        name: &'static str,
         params : S,
-    ) -> Result<D, ()>
+    ) -> Box<Future<Item=D, Error=ServiceError>>
         where
             D: DeserializeOwned + 'static,
             S: Serialize + 'static;
+
+    fn close( self );
 }
 
 /// A proxy object that holds a proxy forwarder and can implement
@@ -78,8 +94,10 @@ pub struct ServiceProxy<S: ?Sized, F>
     phantom_data: std::marker::PhantomData<S>,
 }
 
-impl<S: ?Sized, F> ServiceProxy<S, F> {
+impl<S: ?Sized, F: Forwarder> ServiceProxy<S, F> {
     pub fn new( f: F ) -> ServiceProxy<S, F> {
         ServiceProxy { forwarder: f, phantom_data: std::marker::PhantomData }
     }
+
+    pub fn close( self ) { self.forwarder.close() }
 }

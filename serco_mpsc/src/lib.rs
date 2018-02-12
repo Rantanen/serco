@@ -1,4 +1,11 @@
 
+extern crate futures;
+use futures::prelude::*;
+use futures::sync::oneshot;
+
+extern crate tokio_core;
+use tokio_core::reactor::Core;
+
 extern crate serco;
 extern crate serde;
 #[macro_use] extern crate serde_derive;
@@ -8,8 +15,7 @@ extern crate erased_serde;
 use serde::*;
 use serde::de::DeserializeOwned;
 
-use std::thread;
-use std::sync::mpsc::{Sender, Receiver, channel};
+use futures::sync::mpsc::{Sender, Receiver};
 
 /// Envelope used by the MPSC endpoints to communicate the calls.
 #[derive(Serialize, Deserialize)]
@@ -20,40 +26,50 @@ struct Envelope<'a> {
 
 /// Service endpoint that hosts the services.
 pub struct MpscServiceEndpoint<T: ?Sized> {
-    thread: thread::JoinHandle<()>,
     phantom_data: std::marker::PhantomData<T>
 }
 
 impl<S: serco::ServiceContract + ?Sized + 'static> MpscServiceEndpoint<S> {
 
     /// Opens a new endpoint.
-    pub fn open<TService>(
-        rx: Receiver<String>,
-        tx: Sender<String>,
-        service: TService
-    ) -> MpscServiceEndpoint<S>
+    pub fn run<TService>(
+        rx: Receiver<( String, oneshot::Sender<String> )>,
+        service: TService,
+    )
         where TService: serco::Service<S> + Send + 'static
     {
-        let thread = thread::spawn(move || {
+        let service = std::rc::Rc::new( service );
+        let mut core = Core::new().expect( "Failed to create core" );
 
-            loop {
-                let msg = rx.recv().unwrap();
+        // Turn each message into a future.
+        core.run( rx.for_each( |( msg, tx )| {
+            let service = service.clone();
+
+            let f = futures::future::lazy( move || {
+
                 let envelope : Envelope = serde_json::from_str(&msg).unwrap();
-
-                let mut output = serde_json::Serializer::new( vec![] );
+                let output = serde_json::Serializer::new( vec![] );
                 service.invoke(
                         envelope.name,
                         envelope.params,
-                        &mut output ).unwrap();
+                        output )
+                } )
+                .then( move |result| {
+                    match result {
+                        Ok(output) => unsafe {
+                            tx.send( String::from_utf8_unchecked( output.into_inner() ) )
+                                .map_err( |e| serco::ServiceError::from(e) )
+                        },
+                        Err(e) => Err( serco::ServiceError::from(e) )
+                    }
+                } )
+                .map_err( |e| {
+                    panic!( "{:?}", e.0 );
+                } )
+                .map_err( |_| () );
 
-                tx.send( unsafe { 
-                    String::from_utf8_unchecked( output.into_inner() )
-                } );
-            }
-
-        });
-
-        MpscServiceEndpoint { thread, phantom_data: std::marker::PhantomData }
+            Box::new( f )
+        } ) ).unwrap();
     }
 }
 
@@ -69,14 +85,18 @@ pub struct MpscServiceConnection<T : ?Sized> {
 impl<T: serco::ServiceContract + ?Sized> MpscServiceConnection<T> {
 
     /// Connects to an MPSC endpoint.
-    pub fn connect( rx: Receiver<String>, tx: Sender<String> ) -> MpscServiceConnection<T>
+    pub fn connect( tx: Sender<( String, oneshot::Sender<String> )> ) -> MpscServiceConnection<T>
     {
-        let forwarder = MpscServiceForwarder { rx, tx };
+        let forwarder = MpscServiceForwarder { tx };
         
         MpscServiceConnection {
             proxy: serco::ServiceProxy::new( forwarder ),
             phantom_data: std::marker::PhantomData,
         }
+    }
+
+    pub fn close( self ) {
+        self.proxy.close();
     }
 }
 
@@ -94,32 +114,46 @@ impl<T: serco::ServiceContract + ?Sized> std::ops::Deref for MpscServiceConnecti
 /// Proxy forwarder that can take the method calls from the client and turns
 /// them into messages that can be passed to the service host.
 pub struct MpscServiceForwarder {
-    rx: Receiver<String>,
-    tx: Sender<String>,
+    tx: Sender<( String, oneshot::Sender<String> )>,
 }
 
 impl serco::Forwarder for MpscServiceForwarder
 {
-    fn forward<'de, D, S>(
+    fn forward<D, S>(
         &self,
-        name: &str,
+        name: &'static str,
         params: S
-    ) -> Result<D, ()>
+    ) -> Box<Future<Item=D, Error=serco::ServiceError>>
         where
             D: DeserializeOwned + 'static,
-            S: Serialize
+            S: Serialize + 'static,
     {
-        let value = serde_json::to_value( params ).unwrap();
-        let envelope = Envelope {
-            name: name,
-            params: value,
-        };
+        let tx = self.tx.clone();
+        Box::new( futures::future::lazy( move || {
+            let value = serde_json::to_value( params ).unwrap();
+            let envelope = Envelope {
+                name: name,
+                params: value,
+            };
+            let msg = serde_json::to_string( &envelope ).unwrap();
 
-        self.tx.send( serde_json::to_string( &envelope ).unwrap() );
-        let response = self.rx.recv().unwrap();
-        {
-            serde_json::from_str( &response ).map_err( |_| () )
-        }
+            let (tx_once, rx_once) = oneshot::channel();
+            tx.send( ( msg, tx_once ) )
+                .map_err( |e| serco::ServiceError::from(e) )
+                .then( |_| rx_once )
+        } )
+        .then( |response| {
+            match response {
+                Ok(data)
+                    => serde_json::from_str( &data )
+                            .map_err( |e| serco::ServiceError::from( e ) ),
+                Err(e) => Err( serco::ServiceError::from( e ) )
+            }
+        } ) )
+    }
+
+    fn close( mut self ) {
+        self.tx.close().expect( "Failed to close tx" );
     }
 }
 
