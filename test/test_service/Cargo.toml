@@ -8,3 +8,4 @@ serco = { version = "0.1", path = "../../serco" }
 serco_mpsc = { version = "0.1", path = "../../serco_mpsc" }
 serde = { version = "1.0" }
 serde_derive = { version = "1.0" }
+futures = "0.1"
