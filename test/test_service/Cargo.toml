@@ -1,0 +1,10 @@
+[package]
+name = "test_service"
+version = "0.1.0"
+authors = ["Mikko Rantanen <jubjub@jubjubnest.net>"]
+
+[dependencies]
+serco = { version = "0.1", path = "../../serco" }
+serco_mpsc = { version = "0.1", path = "../../serco_mpsc" }
+serde = { version = "1.0" }
+serde_derive = { version = "1.0" }

@@ -1,0 +1,11 @@
+[package]
+name = "serco"
+version = "0.1.0"
+authors = ["Mikko Rantanen <jubjub@jubjubnest.net>"]
+
+[dependencies]
+serde = "1.0"
+serde_derive = "1.0"
+
+[dev-dependencies]
+serde_json = "1.0"

@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "serco",
+    "serco_derive",
+    "serco_mpsc",
+]
+
+exclude = [ "test" ]
