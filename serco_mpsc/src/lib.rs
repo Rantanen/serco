@@ -1,4 +1,6 @@
 
+#[macro_use] extern crate lazy_static;
+
 extern crate futures;
 use futures::prelude::*;
 use futures::sync::oneshot;
@@ -12,64 +14,236 @@ extern crate serde;
 extern crate serde_json;
 extern crate erased_serde;
 
+use std::collections::HashMap;
+use std::iter::FromIterator;
+
 use serde::*;
 use serde::de::DeserializeOwned;
 
-use futures::sync::mpsc::{Sender, Receiver};
+use futures::sync::mpsc::{Sender, Receiver, channel};
 
 /// Envelope used by the MPSC endpoints to communicate the calls.
-#[derive(Serialize, Deserialize)]
-struct Envelope<'a> {
-    name : &'a str,
+#[derive(Debug, Serialize, Deserialize)]
+struct RequestEnvelope<'a> {
+    endpoint: &'a str,
+    name: &'a str,
     params: serde_json::Value,
+}
+
+/// Envelope used by the MPSC endpoints to communicate the calls.
+#[derive(Debug, Serialize, Deserialize)]
+struct ResponseEnvelope {
+    result: Result<serde_json::Value, serco::ServiceError>,
+}
+
+pub struct MpscServiceHost {
+    endpoint: String,
+    services: HashMap<&'static str, Box<MpscSessionSource>>,
+}
+
+impl MpscServiceHost {
+    pub fn new<T: Into<String>>( endpoint: T ) -> MpscServiceHost {
+        MpscServiceHost {
+            endpoint: endpoint.into(),
+            services: HashMap::new(),
+        }
+    }
+}
+
+use std::sync::Mutex;
+lazy_static! {
+    static ref ENDPOINTS : Mutex<HashMap<String, Endpoint>>
+            = Mutex::new( HashMap::new() );
+}
+type Endpoint = Sender<oneshot::Sender<Sender<(String, oneshot::Sender<String>)>>>;
+
+pub fn get_endpoint( name : &str ) -> Option<Endpoint>
+{
+    let guard = ENDPOINTS.lock().unwrap();
+    guard.get( name ).map( |tx| tx.clone() )
+}
+
+pub fn set_endpoint<T: Into<String>>( name : T, endpoint : Endpoint )
+{
+    let mut guard = ENDPOINTS.lock().unwrap();
+    guard.insert( name.into(), endpoint );
+}
+
+impl serco::ServiceHost for MpscServiceHost {
+
+    fn host<S, T, H>( mut self, service: H ) -> Self
+        where S: serco::ServiceContract + ?Sized + 'static,
+              T: serco::InvokeTarget<S> + 'static,
+              H: serco::HostedService<S, T> + 'static,
+    {
+        self.services.insert( 
+                service.endpoint(),
+                Box::new( MpscSessionSourceData {
+                    p1: std::marker::PhantomData,
+                    p2: std::marker::PhantomData,
+                    hosted_service: service,
+                } ) );
+        self
+    }
+
+    fn run( self ) -> Box<Future<Item=Self, Error=serco::ServiceError>>
+    {
+        let (endpoint_tx, endpoint_rx) = channel(1);
+        set_endpoint( self.endpoint.clone(), endpoint_tx );
+
+        let self_rc = std::rc::Rc::new( self );
+        let this = self_rc.clone();
+        let result = endpoint_rx.for_each( move |client_tx| {
+
+            let sessions = HashMap::from_iter( this.services
+                    .iter()
+                    .map( |(endpoint, session_source)| {
+
+                        let session_id = String::from( "SESSION" );
+                        let session_info = serco::SessionInfo( session_id );
+
+                        (
+                                endpoint.to_string(),
+                                session_source.get_session( session_info )
+                        )
+                    } ) );
+
+            let session = std::rc::Rc::new( MpscSession {
+                services: sessions
+            } );
+
+            let (tx, rx) = channel(1);
+            client_tx.send( tx );
+            rx.for_each( move |(msg, response_tx)| {
+
+                let envelope : RequestEnvelope = serde_json::from_str(&msg).unwrap();
+                let service = session.services.get( envelope.endpoint ).unwrap();
+
+                service.invoke( envelope )
+                    .map( |response| {
+                           let json = serde_json::to_string( &response ).unwrap();
+                           response_tx.send( json )
+                    } )
+                    .map( |_| () )
+                    .map_err( |_| () )
+            } )
+
+        } ).map( |_| std::rc::Rc::try_unwrap( self_rc )
+                        .map_err( |_| () )
+                        .expect( "Previous futures should have finished" ) );
+
+        // TODO: Report issue on bad diagnostics on missing map_err here.
+        Box::new( result.map_err( |e| serco::ServiceError::from(e) ) )
+    }
+}
+
+struct MpscSessionSourceData<S: ?Sized, T, H> {
+    p1: std::marker::PhantomData<S>,
+    p2: std::marker::PhantomData<T>,
+    hosted_service: H
+}
+
+trait MpscSessionSource {
+    fn get_session( &self, session: serco::SessionInfo ) -> Box<MpscServiceSession>;
+}
+
+impl<S, T, H> MpscSessionSource for MpscSessionSourceData<S, T, H>
+    where S: serco::ServiceContract + ?Sized + 'static,
+          T: serco::InvokeTarget<S> + 'static,
+          H: serco::HostedService<S, T> + 'static,
+{
+    fn get_session( &self, session: serco::SessionInfo ) -> Box<MpscServiceSession>
+    {
+        Box::new( MpscServiceSessionData::<S, T, H> {
+            target: self.hosted_service.get_session( session ),
+            service: std::marker::PhantomData,
+            implementation: std::marker::PhantomData,
+        } )
+    }
+}
+
+struct MpscSession {
+    services: HashMap<String, Box<MpscServiceSession>>,
+}
+
+struct MpscServiceSessionData<S, T, H>
+    where S: serco::ServiceContract + ?Sized + 'static,
+          T: serco::InvokeTarget<S> + 'static,
+          H: serco::HostedService<S, T>,
+{
+    target: H::ServiceInstance,
+    service: std::marker::PhantomData<S>,
+    implementation: std::marker::PhantomData<S>,
+}
+
+trait MpscServiceSession {
+    fn invoke(
+        &self,
+        envelope : RequestEnvelope
+    ) -> Box<Future<Item=ResponseEnvelope, Error=()>>;
+}
+
+impl<S, T, H> MpscServiceSession for MpscServiceSessionData<S, T, H>
+    where S: serco::ServiceContract + ?Sized + 'static,
+          T: serco::InvokeTarget<S> + 'static,
+          H: serco::HostedService<S, T>,
+{
+    fn invoke(
+        &self,
+        envelope : RequestEnvelope
+    ) -> Box<Future<Item=ResponseEnvelope, Error=()>>
+    {
+        use serco::InvokeTarget;
+        let output = serde_json::Serializer::new( vec![] );
+        Box::new(
+            self.target.invoke(
+                    envelope.name,
+                    envelope.params,
+                    output )
+            .then( |result| {
+                Ok( match result {
+                    Ok( ok ) => {
+                        ResponseEnvelope {
+                            result: Ok( serde_json::from_slice( &ok.into_inner() ).unwrap() )
+                        }
+                    }
+                    Err( e ) => ResponseEnvelope {
+                        result: Err( serco::ServiceError::from(e) )
+                    },
+                }  )
+            } ) )
+    }
 }
 
 /// Service endpoint that hosts the services.
 pub struct MpscServiceEndpoint<T: ?Sized> {
-    phantom_data: std::marker::PhantomData<T>
+    service: std::rc::Rc<T>,
 }
 
-impl<S: serco::ServiceContract + ?Sized + 'static> MpscServiceEndpoint<S> {
+impl<S: serco::ServiceContract + ?Sized + 'static> serco::SingletonEndpoint<S>
+        for MpscServiceEndpoint<S> {
 
-    /// Opens a new endpoint.
-    pub fn run<TService>(
-        rx: Receiver<( String, oneshot::Sender<String> )>,
-        service: TService,
-    )
-        where TService: serco::Service<S> + Send + 'static
+    fn singleton_host<TService>( service: TService ) -> MpscServiceEndpoint<S>
+        where TService: serco::SingletonService<S> + Send + 'static
     {
-        let service = std::rc::Rc::new( service );
-        let mut core = Core::new().expect( "Failed to create core" );
+        MpscServiceEndpoint {
+            service: service.service().into()
+        }
+    }
+}
 
-        // Turn each message into a future.
-        core.run( rx.for_each( |( msg, tx )| {
-            let service = service.clone();
+pub struct MpscClient {
+    endpoint : String
+}
 
-            let f = futures::future::lazy( move || {
+impl MpscClient {
+    pub fn new<T: Into<String>>( endpoint: T ) -> MpscClient {
+        MpscClient { endpoint: endpoint.into() }
+    }
 
-                let envelope : Envelope = serde_json::from_str(&msg).unwrap();
-                let output = serde_json::Serializer::new( vec![] );
-                service.invoke(
-                        envelope.name,
-                        envelope.params,
-                        output )
-                } )
-                .then( move |result| {
-                    match result {
-                        Ok(output) => unsafe {
-                            tx.send( String::from_utf8_unchecked( output.into_inner() ) )
-                                .map_err( |e| serco::ServiceError::from(e) )
-                        },
-                        Err(e) => Err( serco::ServiceError::from(e) )
-                    }
-                } )
-                .map_err( |e| {
-                    panic!( "{:?}", e.0 );
-                } )
-                .map_err( |_| () );
-
-            Box::new( f )
-        } ) ).unwrap();
+    pub fn connect<T: serco::ServiceContract + ?Sized>( &self, endpoint: &str ) -> Box<Future<Item=MpscServiceConnection<T>, Error=String>>
+    {
+        MpscServiceConnection::<T>::connect( &self.endpoint, endpoint )
     }
 }
 
@@ -85,14 +259,23 @@ pub struct MpscServiceConnection<T : ?Sized> {
 impl<T: serco::ServiceContract + ?Sized> MpscServiceConnection<T> {
 
     /// Connects to an MPSC endpoint.
-    pub fn connect( tx: Sender<( String, oneshot::Sender<String> )> ) -> MpscServiceConnection<T>
+    fn connect( host_endpoint: &str, service_endpoint: &str ) -> Box<Future<Item=MpscServiceConnection<T>, Error=String>>
     {
-        let forwarder = MpscServiceForwarder { tx };
-        
-        MpscServiceConnection {
-            proxy: serco::ServiceProxy::new( forwarder ),
-            phantom_data: std::marker::PhantomData,
-        }
+        let endpoint = get_endpoint( host_endpoint ).unwrap();
+        let ( tx, rx ) = oneshot::channel();
+        let service_endpoint = service_endpoint.into();
+        Box::new( endpoint.send( tx )
+            .then( |_| rx )
+            .map( |connection_tx| {
+
+                let forwarder = MpscServiceForwarder { tx: connection_tx, endpoint: service_endpoint };
+                
+                MpscServiceConnection {
+                    proxy: serco::ServiceProxy::new( forwarder ),
+                    phantom_data: std::marker::PhantomData,
+                }
+            } )
+            .map_err( |e| format!( "{:?}", e ) ) )
     }
 
     pub fn close( self ) {
@@ -114,6 +297,7 @@ impl<T: serco::ServiceContract + ?Sized> std::ops::Deref for MpscServiceConnecti
 /// Proxy forwarder that can take the method calls from the client and turns
 /// them into messages that can be passed to the service host.
 pub struct MpscServiceForwarder {
+    endpoint: String,
     tx: Sender<( String, oneshot::Sender<String> )>,
 }
 
@@ -129,24 +313,26 @@ impl serco::Forwarder for MpscServiceForwarder
             S: Serialize + 'static,
     {
         let tx = self.tx.clone();
-        Box::new( futures::future::lazy( move || {
-            let value = serde_json::to_value( params ).unwrap();
-            let envelope = Envelope {
-                name: name,
-                params: value,
-            };
-            let msg = serde_json::to_string( &envelope ).unwrap();
+        let value = serde_json::to_value( params ).unwrap();
+        let envelope = RequestEnvelope {
+            endpoint: &self.endpoint,
+            name: name,
+            params: value,
+        };
+        let msg = serde_json::to_string( &envelope ).unwrap();
 
+        Box::new( futures::future::lazy( move || {
             let (tx_once, rx_once) = oneshot::channel();
             tx.send( ( msg, tx_once ) )
                 .map_err( |e| serco::ServiceError::from(e) )
                 .then( |_| rx_once )
         } )
-        .then( |response| {
-            match response {
-                Ok(data)
-                    => serde_json::from_str( &data )
-                            .map_err( |e| serco::ServiceError::from( e ) ),
+        .then( |result| {
+            match result {
+                Ok( envelope_str ) => {
+                    let envelope : ResponseEnvelope = serde_json::from_str( &envelope_str ).unwrap();
+                    envelope.result.map( |v| D::deserialize( v ).unwrap() )
+                },
                 Err(e) => Err( serco::ServiceError::from( e ) )
             }
         } ) )

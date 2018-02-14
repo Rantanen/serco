@@ -1,0 +1,9 @@
+[package]
+name = "serco-common"
+version = "0.1.0"
+authors = ["Mikko Rantanen <jubjub@jubjubnest.net>"]
+
+[dependencies]
+syn = { version = "0.12", features = [ "full", "extra-traits" ] }
+quote = "0.4"
+proc-macro2 = "0.2"

@@ -1,10 +1,12 @@
-
 extern crate futures;
 use futures::prelude::*;
 
 extern crate serde;
 use serde::{Serializer, Serialize, Deserializer};
 use serde::de::DeserializeOwned;
+#[macro_use] extern crate serde_derive;
+
+use std::rc::Rc;
 
 #[cfg(test)]
 #[macro_use] extern crate serde_json;
@@ -12,6 +14,7 @@ use serde::de::DeserializeOwned;
 #[macro_use] extern crate serde_derive;
 
 #[derive(Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct ServiceError(pub String);
 impl ServiceError {
     pub fn from<T: std::fmt::Debug>( src: T ) -> ServiceError
@@ -20,11 +23,105 @@ impl ServiceError {
     }
 }
 
-/// A service contract that is callable through dynamic messages.
+/// A trait that specifies service contracts.
 ///
-/// Used through #[derive(ServiceContract)] on the service contract traits.
-pub trait ServiceContract {
+/// Implemented by the `#[service_contract]` attribute.
+pub trait ServiceContract : InvokeTarget<Self> {}
 
+pub trait ServiceHost {
+    fn host<S, T, H>( self, service: H ) -> Self
+        where S: ServiceContract + ?Sized + 'static,
+              T: InvokeTarget<S> + 'static,
+              H: HostedService<S, T> + 'static;
+
+    fn run( self ) -> Box<Future<Item=Self, Error=ServiceError>>;
+}
+
+pub trait SingletonEndpoint<S>
+    where S: ServiceContract + ?Sized + 'static
+{
+    fn singleton_host<T: SingletonService<S> + Send + 'static>( service: T ) -> Self;
+}
+
+pub trait SingletonService<TContract: ServiceContract + ?Sized + 'static>
+        : InvokeTarget<TContract>
+{
+    fn service( self ) -> Box<TContract>;
+}
+
+pub struct SessionInfo( pub String );
+
+pub trait SessionService<TContract: ServiceContract + ?Sized + 'static>
+        : InvokeTarget<TContract>
+{
+    fn construct( session : SessionInfo ) -> Box<TContract>;
+}
+
+pub mod hosted {
+    use super::*;
+
+    pub struct Singleton<S: ?Sized, T> {
+        endpoint: &'static str,
+        pub singleton: std::rc::Rc<T>,
+        phantom_data: std::marker::PhantomData<S>,
+    }
+
+    impl<S, T> Singleton<S, T>
+        where S: ServiceContract + ?Sized + 'static,
+              T: SingletonService<S> + 'static,
+    {
+        pub fn new( singleton: T, endpoint: &'static str ) -> Self {
+            Singleton {
+                endpoint,
+                singleton: std::rc::Rc::new( singleton ),
+                phantom_data: std::marker::PhantomData
+            }
+        }
+    }
+
+    impl<S, T> HostedService<S, T> for Singleton<S, T>
+        where S: ServiceContract + ?Sized + 'static,
+              T: SingletonService<S> + 'static,
+    {
+        type ServiceInstance = std::rc::Rc<T>;
+        fn endpoint(&self) -> &'static str { self.endpoint }
+        fn get_session( &self, session_info : SessionInfo ) -> Self::ServiceInstance {
+            self.singleton.clone()
+        }
+    }
+
+    pub struct Session<S: ?Sized, T> {
+        endpoint: &'static str,
+        phantom_service: std::marker::PhantomData<S>,
+        phantom_session: std::marker::PhantomData<T>,
+    }
+
+    impl<S, T> Session<S, T>
+        where S: ServiceContract + ?Sized + 'static,
+              T: SessionService<S> + 'static,
+    {
+        pub fn new( endpoint: &'static str ) -> Self {
+            Session {
+                endpoint,
+                phantom_service: std::marker::PhantomData,
+                phantom_session: std::marker::PhantomData,
+            }
+        }
+    }
+}
+
+pub trait HostedService<S, T>
+    where S: ServiceContract + ?Sized + 'static,
+          T: InvokeTarget<S> + 'static,
+{
+    type ServiceInstance : InvokeTarget<S>;
+    fn endpoint(&self) -> &'static str;
+    fn get_session( &self, session_info : SessionInfo ) -> Self::ServiceInstance;
+}
+
+pub trait InvokeTarget<Service>
+    where Service: ServiceContract + ?Sized
+{
     fn invoke<'de, D, S>(
         &self,
         name: &str,
@@ -37,22 +134,10 @@ pub trait ServiceContract {
             for <'a> &'a mut S: Serializer;
 }
 
-/// An implementation for the service contract `TContract`.
-///
-/// Needed so that we can call `ServiceContract` methods on a struct that
-/// implements `TContract`, which implements `ServiceContract`.
-///
-/// The generic parameter really has no other purpose than to allow
-/// implementing multiple Services on a single struct:
-///
-/// ```
-/// impl Service<MyService> for AStruct { ... }
-/// impl Service<AnotherService> for AStruct { ... }
-/// ```
-///
-/// Used through `#[derive(Service<MyService>)]`.
-pub trait Service<TContract: ServiceContract + ?Sized + 'static> {
-
+impl<A, B> InvokeTarget<A> for std::rc::Rc<B>
+    where A: ServiceContract + ?Sized,
+          B: InvokeTarget<A> + ?Sized,
+{
     fn invoke<'de, D, S>(
         &self,
         name: &str,
@@ -62,7 +147,10 @@ pub trait Service<TContract: ServiceContract + ?Sized + 'static> {
         where
             D: Deserializer<'de>,
             S: 'static,
-            for <'a> &'a mut S: Serializer;
+            for <'a> &'a mut S: Serializer
+    {
+        ( self as &B ).invoke( name, params, output )
+    }
 }
 
 /// A service forwarder used by the proxy implementation.
