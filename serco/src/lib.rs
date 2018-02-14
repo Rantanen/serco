@@ -7,6 +7,8 @@ use serde::de::DeserializeOwned;
 #[macro_use] extern crate serde_derive;
 
 use std::rc::Rc;
+use std::marker::PhantomData;
+use std::collections::HashMap;
 
 #[cfg(test)]
 #[macro_use] extern crate serde_json;
@@ -22,6 +24,179 @@ impl ServiceError {
         ServiceError( format!( "{:?}", src ) )
     }
 }
+
+pub struct ServiceHost2<
+        TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    where TService: ServiceContract + ?Sized + 'static,
+          TImplementation: InvokeTarget<TService> + 'static,
+          THostImplementation: HostedService<TService, TImplementation> + 'static,
+{
+    hosted: THostImplementation,
+    session_factory: TSessionFactory,
+    endpoints: Vec<Box<ServiceEndpoint<TService, TImplementation, THostImplementation, TSessionFactory>>>,
+    sessions: HashMap<SessionInfo, Rc<THostImplementation::ServiceInstance>>,
+
+    p_service: PhantomData<TService>,
+    p_implementation: PhantomData<TImplementation>,
+}
+
+impl<TService,
+        TImplementation,
+        THostImplementation>
+    ServiceHost2<
+        TService,
+        TImplementation,
+        THostImplementation,
+        DefaultSessionFactory>
+    where TService: ServiceContract + ?Sized + 'static,
+          TImplementation: InvokeTarget<TService> + 'static,
+          THostImplementation: HostedService<TService, TImplementation> + 'static,
+{
+    pub fn new(
+        service : THostImplementation
+    ) -> ServiceHost2<
+        TService,
+        TImplementation,
+        THostImplementation,
+        DefaultSessionFactory>
+    {
+        ServiceHost2 {
+            hosted: service,
+
+            session_factory: Default::default(),
+            endpoints: Default::default(),
+            sessions: Default::default(),
+
+            p_service: PhantomData,
+            p_implementation: PhantomData,
+        }
+    }
+}
+
+impl<TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    ServiceHost2<
+        TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    where TService: ServiceContract + ?Sized + 'static,
+          TImplementation: InvokeTarget<TService> + 'static,
+          THostImplementation: HostedService<TService, TImplementation> + 'static,
+          TSessionFactory: SessionFactory + 'static,
+{
+    pub fn endpoint<TEndpoint: ServiceEndpoint<TService, TImplementation, THostImplementation, TSessionFactory> + 'static>(
+        mut self,
+        endpoint: TEndpoint
+    ) -> Self
+    {
+        self.endpoints.push( Box::new( endpoint ) );
+        self
+    }
+
+    pub fn run( self ) -> Box<Future<Item=Self, Error=ServiceError>>
+    {
+        let runtime = Rc::new( HostRuntime {
+            hosted: self.hosted,
+            session_factory: self.session_factory,
+            sessions: self.sessions,
+        } );
+
+        let runtime_clone = runtime.clone();
+        let run_futures = futures::future::join_all( self.endpoints
+            .into_iter()
+            .map( move |endpoint| {
+                endpoint.run( runtime_clone.clone() ).map( |_| endpoint )
+            } ) );
+
+        let final_future = run_futures.then( |run_results| match run_results {
+            Ok(endpoints) => {
+                let runtime = Rc::try_unwrap( runtime )
+                            .map_err( |_| "Leaking RCs" )
+                            .unwrap();
+
+                Ok( ServiceHost2 {
+                    hosted: runtime.hosted,
+                    session_factory: runtime.session_factory,
+                    sessions: runtime.sessions,
+                    endpoints: endpoints,
+                    p_service: PhantomData,
+                    p_implementation: PhantomData,
+                } )
+            },
+            Err( e ) => Err( ServiceError::from(e) ),
+        } );
+
+        Box::new( final_future )
+    }
+}
+
+pub struct HostRuntime<TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    where TService: ServiceContract + ?Sized + 'static,
+          TImplementation: InvokeTarget<TService> + 'static,
+          THostImplementation: HostedService<TService, TImplementation> + 'static,
+          TSessionFactory: SessionFactory + 'static,
+{
+    hosted: THostImplementation,
+    session_factory: TSessionFactory,
+    sessions: HashMap<SessionInfo, Rc<THostImplementation::ServiceInstance>>,
+}
+
+impl<TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    HostRuntime<
+        TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    where TService: ServiceContract + ?Sized + 'static,
+          TImplementation: InvokeTarget<TService> + 'static,
+          THostImplementation: HostedService<TService, TImplementation> + 'static,
+          TSessionFactory: SessionFactory + 'static,
+{
+    pub fn get_session( &self, id: Option<SessionInfo> ) -> Rc<THostImplementation::ServiceInstance>
+    {
+        Rc::new( self.hosted.get_session( SessionInfo(String::from("")) ) )
+    }
+}
+
+pub trait ServiceEndpoint<TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    where TService: ServiceContract + ?Sized + 'static,
+          TImplementation: InvokeTarget<TService> + 'static,
+          THostImplementation: HostedService<TService, TImplementation> + 'static,
+          TSessionFactory: SessionFactory,
+{
+    fn run(
+        &self,
+        host: Rc<HostRuntime<
+                TService,
+                TImplementation,
+                THostImplementation,
+                TSessionFactory>>
+    ) -> Box<Future<Item=(), Error=ServiceError>>;
+}
+
+pub trait SessionFactory {}
+pub struct DefaultSessionFactory;
+impl Default for DefaultSessionFactory {
+    fn default() -> Self {
+        DefaultSessionFactory
+    }
+}
+impl SessionFactory for DefaultSessionFactory {}
 
 /// A trait that specifies service contracts.
 ///
@@ -49,6 +224,7 @@ pub trait SingletonService<TContract: ServiceContract + ?Sized + 'static>
     fn service( self ) -> Box<TContract>;
 }
 
+#[derive(PartialEq, Eq, Hash)]
 pub struct SessionInfo( pub String );
 
 pub trait SessionService<TContract: ServiceContract + ?Sized + 'static>

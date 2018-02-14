@@ -9,6 +9,7 @@ extern crate tokio_core;
 use tokio_core::reactor::Core;
 
 extern crate serco;
+use serco::InvokeTarget;
 extern crate serde;
 #[macro_use] extern crate serde_derive;
 extern crate serde_json;
@@ -16,6 +17,7 @@ extern crate erased_serde;
 
 use std::collections::HashMap;
 use std::iter::FromIterator;
+use std::rc::Rc;
 
 use serde::*;
 use serde::de::DeserializeOwned;
@@ -35,6 +37,102 @@ struct RequestEnvelope<'a> {
 struct ResponseEnvelope {
     result: Result<serde_json::Value, serco::ServiceError>,
 }
+
+
+pub struct MpscEndpoint {
+    endpoint: String,
+}
+
+impl MpscEndpoint {
+    pub fn new<T: Into<String>>( endpoint: T ) -> Self {
+        Self { endpoint: endpoint.into() }
+    }
+}
+
+impl<TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    serco::ServiceEndpoint<TService,
+        TImplementation,
+        THostImplementation,
+        TSessionFactory>
+    for MpscEndpoint
+    where TService: serco::ServiceContract + ?Sized + 'static,
+          TImplementation: serco::InvokeTarget<TService> + 'static,
+          THostImplementation: serco::HostedService<TService, TImplementation> + 'static,
+          TSessionFactory: serco::SessionFactory + 'static,
+{
+    fn run(
+        &self,
+        host: Rc<serco::HostRuntime<
+                TService,
+                TImplementation,
+                THostImplementation,
+                TSessionFactory>>
+    ) -> Box<Future<Item=(), Error=serco::ServiceError>>
+    {
+        let (endpoint_tx, endpoint_rx) = channel(1);
+        set_endpoint( self.endpoint.clone(), endpoint_tx );
+
+        let result = endpoint_rx.for_each( move |client_tx| {
+
+            let session = host.get_session( None );
+
+            let (tx, rx) = channel(1);
+            client_tx.send( tx );
+            rx.for_each( move |(msg, response_tx)| {
+
+                let envelope : RequestEnvelope = serde_json::from_str(&msg).unwrap();
+                let output = serde_json::Serializer::new( vec![] );
+                Box::new(
+                    session.invoke(
+                            envelope.name,
+                            envelope.params,
+                            output )
+                    .then( |result| {
+                        Ok( match result {
+                            Ok( ok ) => {
+                                ResponseEnvelope {
+                                    result: Ok( serde_json::from_slice( &ok.into_inner() ).unwrap() )
+                                }
+                            }
+                            Err( e ) => ResponseEnvelope {
+                                result: Err( serco::ServiceError::from(e) )
+                            },
+                        }  )
+                    } ) )
+                    .map( |response| {
+                           let json = serde_json::to_string( &response ).unwrap();
+                           response_tx.send( json )
+                    } )
+                    .map( |_| () )
+            } )
+
+        } );
+
+        // TODO: Report issue on bad diagnostics on missing map_err here.
+        Box::new( result.map_err( |e| serco::ServiceError::from(e) ) )
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 pub struct MpscServiceHost {
     endpoint: String,

@@ -40,12 +40,17 @@ impl MyService for MyServiceImplementation {
 
 fn main() {
 
+
     thread::spawn( move || {
 
-        let host = MpscServiceHost::new( "foo" )
-                .host( MyService::singleton( MyServiceImplementation( "u" ), "unique" ) )
-                .host( MyService::singleton( MyServiceImplementation( "single" ), "singleton" ) )
+        let host = serco::ServiceHost2::new( MyService::singleton( MyServiceImplementation( "u" ), "unique" ) )
+                .endpoint( MpscEndpoint::new( "test" ) )
                 .run();
+
+        // let host = MpscServiceHost::new( "foo" )
+        //         .host( MyService::singleton( MyServiceImplementation( "u" ), "unique" ) )
+        //         .host( MyService::singleton( MyServiceImplementation( "single" ), "singleton" ) )
+        //         .run();
 
         let mut core = Core::new().expect( "Failed to create core" );
         core.run( host ).unwrap();
@@ -55,7 +60,7 @@ fn main() {
     thread::sleep( std::time::Duration::from_millis( 10 ) );
 
     // Connect to the service.
-    MpscClient::new( "foo" ).connect::<MyService>( "singleton" ).map( |conn| {
+    MpscClient::new( "test" ).connect::<MyService>( "singleton" ).map( |conn| {
 
         // Call the service.
         println!( "{}", conn.name() );
@@ -63,7 +68,7 @@ fn main() {
     } ).wait().unwrap();
 
     // Connect to the service.
-    MpscClient::new( "foo" ).connect::<MyService>( "unique" ).map( |conn| {
+    MpscClient::new( "test" ).connect::<MyService>( "unique" ).map( |conn| {
 
         // Call the service.
         println!( "{}", conn.name() );
