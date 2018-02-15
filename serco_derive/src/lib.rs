@@ -18,10 +18,11 @@ pub fn service(
     let model = serco_common::ServiceModel
                     ::try_from( attr.into(), input.clone().into() ).unwrap();
     let struct_ident = model.name;
+    let mod_ident = model.mod_ident;
 
     let mut output = vec![];
 
-    if !model.has_session {
+    // if !model.has_session {
         for service in &model.services {
             output.push( quote!(
                 impl serco::SingletonService< #service > for #struct_ident {
@@ -31,7 +32,7 @@ pub fn service(
                 }
             ) );
         }
-    }
+    // }
 
     for service in &model.services {
         output.push( quote!(
@@ -53,7 +54,7 @@ pub fn service(
         ) );
     }
 
-    let output = quote!( mod service_impl {
+    let output = quote!( mod #mod_ident {
         extern crate serco;
         extern crate futures;
         use self::futures::prelude::*;
@@ -178,19 +179,19 @@ pub fn service_contract(
 
         impl #service_name {
 
-            pub fn singleton<T>(
+            pub fn singleton<T, I>(
                 service: T,
                 endpoint: &'static str,
-            ) -> serco::hosted::Singleton<#service_name, T>
-                where T: SingletonService<#service_name> + Send + 'static
+            ) -> serco::hosted::Singleton<#service_name, T, I>
+                where T: SingletonService<#service_name> + 'static
             {
                 serco::hosted::Singleton::new( service, endpoint )
             }
 
-            pub fn host<T>(
+            pub fn session<T>(
                 endpoint: &'static str,
             ) -> serco::hosted::Session<#service_name, T>
-                where T: SessionService<#service_name> + Send + 'static
+                where T: SessionService<#service_name> + 'static
             {
                 serco::hosted::Session::new( endpoint )
             }

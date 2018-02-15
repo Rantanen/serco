@@ -44,6 +44,7 @@ pub enum ServiceError {
 #[derive(Debug, PartialEq)]
 pub struct ServiceModel {
     pub name: Ident,
+    pub mod_ident: Ident,
     pub services: HashSet<Ident>,
     pub has_session: bool,
 }
@@ -119,6 +120,7 @@ impl ServiceModel {
                 .map_err( |_| ServiceError::BadItem )?;
         let args : ServiceAttributeArgs = syn::parse2( attribute )
                 .map_err( |_| ServiceError::BadAttribute )?;
+        let mod_ident = Ident::from( format!( "{}_impl_mod", input.ident ) );
 
         let has_session = input.fields.iter()
                 .find( |&f|
@@ -134,6 +136,7 @@ impl ServiceModel {
 
         Ok( ServiceModel {
             name: input.ident,
+            mod_ident: mod_ident,
             services: args.services,
             has_session,
         } )
