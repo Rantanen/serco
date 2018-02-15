@@ -22,17 +22,15 @@ pub fn service(
 
     let mut output = vec![];
 
-    // if !model.has_session {
-        for service in &model.services {
-            output.push( quote!(
-                impl serco::SingletonService< #service > for #struct_ident {
-                    fn service( self ) -> Box< #service > {
-                        Box::new( self )
-                    }
+    for service in &model.services {
+        output.push( quote!(
+            impl serco::SingletonService< #service > for #struct_ident {
+                fn service( self ) -> Box< #service > {
+                    Box::new( self )
                 }
-            ) );
-        }
-    // }
+            }
+        ) );
+    }
 
     for service in &model.services {
         output.push( quote!(
@@ -54,11 +52,15 @@ pub fn service(
         ) );
     }
 
-    let output = quote!( mod #mod_ident {
+    let output = quote!( #[allow(non_snake_case)] mod #mod_ident {
         extern crate serco;
+
         extern crate futures;
+        #[allow(unused_imports)]
         use self::futures::prelude::*;
+
         extern crate serde;
+        #[allow(unused_imports)]
         use self::serde::{Deserializer, Serializer};
 
         #( #output )*
@@ -71,12 +73,12 @@ pub fn service(
 
 #[proc_macro_attribute]
 pub fn service_contract(
-    _attr: TokenStream,
+    attr: TokenStream,
     input: TokenStream
 ) -> TokenStream
 {
     let model = serco_common::ServiceContractModel
-                    ::try_from(input.clone().into()).unwrap();
+                    ::try_from( attr.into(), input.clone().into() ).unwrap();
 
     let ( op_arms, proxy_fns ) : ( Vec<_>, Vec<_> ) = model.operations
                                    .into_iter()
@@ -119,7 +121,7 @@ pub fn service_contract(
                         );
                     }
 
-                    Box::new( Ok( output ).into_future() )
+                    Ok( output ).into_future()
                 } ),
                 quote!( fn #name( &self, #( #arg_defs ),* ) -> #output {
 
@@ -130,6 +132,7 @@ pub fn service_contract(
 
                     let params = Params { #( #args ),* };
                     let result = self.forwarder.forward( #name_str, params );
+
                     result.wait().unwrap()
                 } )
             )
@@ -137,7 +140,9 @@ pub fn service_contract(
         .unzip();
 
     let service_name = model.name;
-    let output = quote!( mod serco_impl {
+    let mod_ident = model.mod_ident;
+    let callback = model.callback_interface;
+    let output = quote!( #[allow(non_snake_case)] mod #mod_ident {
 
         use super::*;
 
@@ -154,7 +159,30 @@ pub fn service_contract(
         use self::serco::{ServiceContract, ServiceProxy, Forwarder,
                 SingletonService, SessionService};
 
-        impl ServiceContract for #service_name {}
+        #[allow(unused_imports)] use std::cell::RefCell;
+        #[allow(unused_imports)] use std::sync::Arc;
+        task_local!{
+            static CALLBACK: RefCell<Option<Arc<#service_name + Send + Sync>>> =
+                    RefCell::new(None)
+        }
+
+        impl ServiceContract for #service_name
+        {
+            type CallbackContract = #callback;
+
+            fn set_task_callback<F: Forwarder>(
+                callback : Arc<ServiceProxy<Self, F>>
+            ) {
+                CALLBACK.with( |cell| cell.replace( Some( callback ) ) );
+            }
+
+            fn get_task_callback() -> Arc<Self>
+            {
+                CALLBACK.with( |cell| {
+                    cell.borrow().as_ref().map( |o| o.clone() ).unwrap()
+                } )
+            }
+        }
 
         impl serco::InvokeTarget<#service_name> for #service_name {
 
@@ -181,19 +209,21 @@ pub fn service_contract(
 
             pub fn singleton<T, I>(
                 service: T,
-                endpoint: &'static str,
             ) -> serco::hosted::Singleton<#service_name, T, I>
                 where T: SingletonService<#service_name> + 'static
             {
-                serco::hosted::Singleton::new( service, endpoint )
+                serco::hosted::Singleton::new( service )
             }
 
             pub fn session<T>(
-                endpoint: &'static str,
             ) -> serco::hosted::Session<#service_name, T>
                 where T: SessionService<#service_name> + 'static
             {
-                serco::hosted::Session::new( endpoint )
+                serco::hosted::Session::new()
+            }
+
+            pub fn get_callback() -> Arc<#callback> {
+                <Self as ServiceContract>::CallbackContract::get_task_callback()
             }
         }
 

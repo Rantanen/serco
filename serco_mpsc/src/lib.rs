@@ -6,28 +6,27 @@ use futures::prelude::*;
 use futures::sync::oneshot;
 
 extern crate tokio_core;
-use tokio_core::reactor::Core;
+use tokio_core::reactor::{Core};
 
 extern crate serco;
-use serco::InvokeTarget;
+use serco::{InvokeTarget, ServiceContract};
 extern crate serde;
 #[macro_use] extern crate serde_derive;
 extern crate serde_json;
 extern crate erased_serde;
 
 use std::collections::HashMap;
-use std::iter::FromIterator;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde::*;
 use serde::de::DeserializeOwned;
 
-use futures::sync::mpsc::{Sender, Receiver, channel};
+use futures::sync::mpsc::{Sender, channel};
 
 /// Envelope used by the MPSC endpoints to communicate the calls.
 #[derive(Debug, Serialize, Deserialize)]
 struct RequestEnvelope<'a> {
-    endpoint: &'a str,
     name: &'a str,
     params: serde_json::Value,
 }
@@ -73,38 +72,50 @@ impl<TService,
         let (endpoint_tx, endpoint_rx) = channel(1);
         set_endpoint( self.endpoint.clone(), endpoint_tx );
 
-        let result = endpoint_rx.for_each( move |client_tx| {
+        let result = endpoint_rx.for_each( move |(client_tx, callback_tx)| {
 
             let ( session_id, session ) = host.get_session( None );
+            let session = Rc::new( session );
 
             let (tx, rx) = channel(1);
-            client_tx.send(( session_id.to_string(), tx ));
+            client_tx.send(( session_id.to_string(), tx )).unwrap();
+
+            let forwarder = Arc::new( serco::ServiceProxy::new(
+                    MpscForwarder {
+                        _id: session_id.to_string(),
+                        tx: callback_tx,
+                    } ) );
+
             rx.for_each( move |(msg, response_tx)| {
 
-                let envelope : RequestEnvelope = serde_json::from_str(&msg).unwrap();
+                let forwarder = forwarder.clone();
+                let session = session.clone();
+                
                 let output = serde_json::Serializer::new( vec![] );
-                Box::new(
-                    session.invoke(
-                            envelope.name,
-                            envelope.params,
-                            output )
-                    .then( |result| {
-                        Ok( match result {
-                            Ok( ok ) => {
-                                ResponseEnvelope {
-                                    result: Ok( serde_json::from_slice( &ok.into_inner() ).unwrap() )
-                                }
+                TService::CallbackContract::set_task_callback( forwarder );
+                let envelope : RequestEnvelope =
+                        serde_json::from_str(&msg).unwrap();
+                session.invoke(
+                        envelope.name,
+                        envelope.params,
+                        output )
+                .then( |result| {
+                    Ok( match result {
+                        Ok( ok ) => {
+                            ResponseEnvelope {
+                                result: Ok( serde_json::from_slice( &ok.into_inner() ).unwrap() )
                             }
-                            Err( e ) => ResponseEnvelope {
-                                result: Err( serco::ServiceError::from(e) )
-                            },
-                        }  )
-                    } ) )
-                    .map( |response| {
-                           let json = serde_json::to_string( &response ).unwrap();
-                           response_tx.send( json )
-                    } )
-                    .map( |_| () )
+                        }
+                        Err( e ) => ResponseEnvelope {
+                            result: Err( serco::ServiceError::from(e) )
+                        },
+                    }  )
+                } )
+                .map( |response| {
+                       let json = serde_json::to_string( &response ).unwrap();
+                       response_tx.send( json )
+                } )
+                .map( |_| () )
             } )
 
         } );
@@ -137,7 +148,16 @@ lazy_static! {
     static ref ENDPOINTS : Mutex<HashMap<String, Endpoint>>
             = Mutex::new( HashMap::new() );
 }
-type Endpoint = Sender<oneshot::Sender<(String, Sender<(String, oneshot::Sender<String>)>)>>;
+type Endpoint = Sender<(  // Host listen callback.
+    oneshot::Sender<(     // Client on-connect callback
+        String,           // Session ID
+        Sender<(          // Client request pipe
+            String,
+            oneshot::Sender<String>
+        )>
+    )>,
+    Sender<( String, oneshot::Sender<String>)>  // Server callback pipe
+)>;
 
 pub fn get_endpoint( name : &str ) -> Option<Endpoint>
 {
@@ -152,18 +172,37 @@ pub fn set_endpoint<T: Into<String>>( name : T, endpoint : Endpoint )
 }
 
 pub struct MpscClient {
-    endpoint : String
+    endpoint : String,
 }
 
 impl MpscClient {
     pub fn new<T: Into<String>>( endpoint: T ) -> MpscClient {
-        MpscClient { endpoint: endpoint.into() }
+        MpscClient {
+            endpoint: endpoint.into(),
+        }
     }
 
-    pub fn connect<T: serco::ServiceContract + ?Sized>( &self, endpoint: &str ) -> Box<Future<Item=MpscServiceConnection<T>, Error=String>>
+    pub fn connect<S>(
+        &self,
+    ) -> Box<Future<Item=MpscServiceConnection<S>, Error=String>>
+        where S: serco::ServiceContract<CallbackContract = ()> + ?Sized + 'static,
     {
-        MpscServiceConnection::<T>::connect( &self.endpoint, endpoint )
+        MpscServiceConnection::<S>::connect(
+                &self.endpoint, () )
     }
+
+    pub fn connect_duplex<S, C, T>(
+        &self,
+        callback: T,
+    ) -> Box<Future<Item=MpscServiceConnection<S>, Error=String>>
+        where S: serco::ServiceContract<CallbackContract = C> + ?Sized + 'static,
+            C: serco::ServiceContract<CallbackContract = ()> + ?Sized + 'static,
+            T: serco::InvokeTarget<C> + Send + 'static,
+    {
+        MpscServiceConnection::<S>::connect(
+                &self.endpoint, callback )
+    }
+
 }
 
 /// Service connection used by the client implementation.
@@ -171,31 +210,70 @@ impl MpscClient {
 /// (Since the real functionality is in the forwarder, this should probably
 /// move to the framework at some point)
 pub struct MpscServiceConnection<T : ?Sized> {
-    proxy: serco::ServiceProxy<T, MpscServiceForwarder>,
+    proxy: serco::ServiceProxy<T, MpscForwarder>,
     phantom_data: std::marker::PhantomData<T>,
+    _callback_handle: std::thread::JoinHandle<()>,
 }
 
-impl<T: serco::ServiceContract + ?Sized> MpscServiceConnection<T> {
+impl<T: serco::ServiceContract + ?Sized + 'static> MpscServiceConnection<T> {
 
     /// Connects to an MPSC endpoint.
-    fn connect( host_endpoint: &str, service_endpoint: &str ) -> Box<Future<Item=MpscServiceConnection<T>, Error=String>>
+    pub fn connect<C>(
+        host_endpoint: &str,
+        callback: C,
+    ) -> Box<Future<Item=MpscServiceConnection<T>, Error=String>>
+        where C: serco::InvokeTarget<T::CallbackContract> + Send + 'static
     {
         let endpoint = get_endpoint( host_endpoint ).unwrap();
         let ( tx, rx ) = oneshot::channel();
-        let service_endpoint = service_endpoint.into();
-        Box::new( endpoint.send( tx )
+        let ( callback_tx, callback_rx ) =
+                channel::<(String, oneshot::Sender<String>)>(1);
+
+        let join_handle = std::thread::spawn( move || {
+            let mut core = Core::new().expect( "Failed to spawn callback core" );
+            core.run( callback_rx.for_each( move |(msg, response_tx)| {
+
+                let output = serde_json::Serializer::new( vec![] );
+                let envelope : RequestEnvelope =
+                        serde_json::from_str(&msg).unwrap();
+                callback.invoke(
+                        envelope.name,
+                        envelope.params,
+                        output )
+                .then( |result| {
+                    Ok( match result {
+                        Ok( ok ) => {
+                            ResponseEnvelope {
+                                result: Ok( serde_json::from_slice( &ok.into_inner() ).unwrap() )
+                            }
+                        }
+                        Err( e ) => ResponseEnvelope {
+                            result: Err( serco::ServiceError::from(e) )
+                        },
+                    }  )
+                } )
+                .map( |response| {
+                       let json = serde_json::to_string( &response ).unwrap();
+                       response_tx.send( json )
+                } )
+                .map( |_| () )
+
+            } ) ).unwrap();
+        } );
+
+        Box::new( endpoint.send(( tx, callback_tx ))
             .then( |_| rx )
             .map( |( id, connection_tx )| {
 
-                let forwarder = MpscServiceForwarder {
-                    id: id,
+                let forwarder = MpscForwarder {
+                    _id: id,
                     tx: connection_tx,
-                    endpoint: service_endpoint
                 };
                 
                 MpscServiceConnection {
                     proxy: serco::ServiceProxy::new( forwarder ),
                     phantom_data: std::marker::PhantomData,
+                    _callback_handle: join_handle,
                 }
             } )
             .map_err( |e| format!( "{:?}", e ) ) )
@@ -210,7 +288,7 @@ impl<T: serco::ServiceContract + ?Sized> MpscServiceConnection<T> {
 /// The proxy implements the actual service trait.
 impl<T: serco::ServiceContract + ?Sized> std::ops::Deref for MpscServiceConnection<T>
 {
-    type Target = serco::ServiceProxy<T, MpscServiceForwarder>;
+    type Target = serco::ServiceProxy<T, MpscForwarder>;
 
     fn deref( &self ) -> &Self::Target {
         &self.proxy
@@ -219,13 +297,12 @@ impl<T: serco::ServiceContract + ?Sized> std::ops::Deref for MpscServiceConnecti
 
 /// Proxy forwarder that can take the method calls from the client and turns
 /// them into messages that can be passed to the service host.
-pub struct MpscServiceForwarder {
-    id: String,
-    endpoint: String,
+pub struct MpscForwarder {
+    _id: String,
     tx: Sender<( String, oneshot::Sender<String> )>,
 }
 
-impl serco::Forwarder for MpscServiceForwarder
+impl serco::Forwarder for MpscForwarder
 {
     fn forward<D, S>(
         &self,
@@ -239,7 +316,6 @@ impl serco::Forwarder for MpscServiceForwarder
         let tx = self.tx.clone();
         let value = serde_json::to_value( params ).unwrap();
         let envelope = RequestEnvelope {
-            endpoint: &self.endpoint,
             name: name,
             params: value,
         };
@@ -266,4 +342,3 @@ impl serco::Forwarder for MpscServiceForwarder
         self.tx.close().expect( "Failed to close tx" );
     }
 }
-

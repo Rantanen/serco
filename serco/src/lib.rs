@@ -2,19 +2,36 @@ extern crate futures;
 use futures::prelude::*;
 
 extern crate serde;
-use serde::{Serializer, Serialize, Deserializer, Deserialize};
+use serde::{Serializer, Serialize, Deserializer};
 use serde::de::DeserializeOwned;
 #[macro_use] extern crate serde_derive;
 
+// The crate doesn't really need the macros. However Rust will complain that
+// the import does nothing if we don't define #[macro_use]. Once we define
+// #[macro_use] to get rid of that warning, Rust will complain that the
+// #[macro_use] does nothing. Fortunately THAT warning comes with a named
+// warning option so we can allow that explicitly.
+//
+// Unfortunately clippy disagrees on the macro_use being unused and claims that
+// the unused_imports attribute is useless. So now we also need to tell clippy
+// to ignore useless attributes in this scenario! \:D/
+//
+// Intercom encountered the same issue, but I suspect it got "fixed" once it
+// started to actually use the proc macros internally. Serco doesn't.
+#[cfg_attr(feature = "cargo-clippy", allow(useless_attribute))]
+#[allow(unused_imports)]
+#[macro_use]
+extern crate serco_derive;
+pub mod prelude {
+    pub use serco_derive::*;
+    pub use super::ServiceContract;
+}
+
 use std::rc::Rc;
+use std::sync::Arc;
 use std::marker::PhantomData;
 use std::collections::HashMap;
 use std::borrow::Cow;
-
-#[cfg(test)]
-#[macro_use] extern crate serde_json;
-#[cfg(test)]
-#[macro_use] extern crate serde_derive;
 
 #[derive(Debug)]
 #[derive(Serialize, Deserialize)]
@@ -26,7 +43,7 @@ impl ServiceError {
     }
 }
 
-pub struct ServiceHost2<
+pub struct ServiceHost<
         TService,
         TSessionFactory,
         THostImplementation,
@@ -44,7 +61,7 @@ pub struct ServiceHost2<
 
 impl<TService,
         THostImplementation>
-    ServiceHost2<
+    ServiceHost<
         TService,
         DefaultSessionFactory,
         THostImplementation,
@@ -54,13 +71,13 @@ impl<TService,
 {
     pub fn new(
         service : THostImplementation
-    ) -> ServiceHost2<
+    ) -> ServiceHost<
         TService,
         DefaultSessionFactory,
         THostImplementation,
     >
     {
-        ServiceHost2 {
+        ServiceHost {
             hosted: service,
 
             session_factory: Default::default(),
@@ -76,7 +93,7 @@ impl<TService,
         TSessionFactory,
         THostImplementation,
     >
-    ServiceHost2<
+    ServiceHost<
         TService,
         TSessionFactory,
         THostImplementation,
@@ -88,13 +105,13 @@ impl<TService,
     pub fn session_factory<TNewSessionFactory: SessionFactory + 'static>(
         self,
         session_factory: TNewSessionFactory
-    ) -> ServiceHost2<
+    ) -> ServiceHost<
             TService,
             TNewSessionFactory,
             THostImplementation,
         >
     {
-        ServiceHost2 {
+        ServiceHost {
             hosted: self.hosted,
 
             session_factory: session_factory,
@@ -135,7 +152,7 @@ impl<TService,
                             .map_err( |_| "Leaking RCs" )
                             .unwrap();
 
-                Ok( ServiceHost2 {
+                Ok( ServiceHost {
                     hosted: runtime.hosted,
                     session_factory: runtime.session_factory,
                     sessions: runtime.sessions,
@@ -241,13 +258,15 @@ impl SessionFactory for DefaultSessionFactory {
     type SessionInfo = SessionId;
     fn create_session( &self ) -> ( String, Rc<Self::SessionInfo> )
     {
+        // TODO: Implement.
         (
             String::from( "" ),
             Rc::new( SessionId( "".into() ) )
         )
     }
-    fn get_session( &self, key : &str ) -> Rc<Self::SessionInfo>
+    fn get_session( &self, _key : &str ) -> Rc<Self::SessionInfo>
     {
+        // TODO: Implement.
         Rc::new( SessionId( "".into() ) )
     }
 }
@@ -255,15 +274,35 @@ impl SessionFactory for DefaultSessionFactory {
 /// A trait that specifies service contracts.
 ///
 /// Implemented by the `#[service_contract]` attribute.
-pub trait ServiceContract : InvokeTarget<Self> {}
+pub trait ServiceContract : InvokeTarget<Self> {
+    type CallbackContract: ServiceContract<CallbackContract = ()> + ?Sized;
 
-pub trait ServiceHost {
-    fn host<S, T, H>( self, service: H ) -> Self
-        where S: ServiceContract + ?Sized + 'static,
-              T: InvokeTarget<S> + 'static,
-              H: HostedService<S> + 'static;
+    fn set_task_callback<F: Forwarder>( callback : Arc<ServiceProxy<Self, F>> );
+    fn get_task_callback() -> Arc<Self>;
+}
 
-    fn run( self ) -> Box<Future<Item=Self, Error=ServiceError>>;
+impl ServiceContract for () {
+    type CallbackContract = ();
+
+    fn set_task_callback<F: Forwarder>( _ : Arc<ServiceProxy<Self, F>> ) {}
+    fn get_task_callback() -> Arc<Self> { Arc::new(())}
+}
+
+impl InvokeTarget<()> for () {
+    fn invoke<'de, D, S>(
+        &self,
+        _name: &str,
+        _params : D,
+        _output : S
+    ) -> Box<Future<Item=S, Error=ServiceError>>
+        where
+            D: Deserializer<'de>,
+            S: 'static,
+            for <'a> &'a mut S: Serializer
+    {
+        // TODO: Replace with bad method service error.
+        panic!( "Nothing should ever be invoked on ()" );
+    }
 }
 
 pub trait SingletonEndpoint<S>
@@ -292,7 +331,6 @@ pub mod hosted {
     use super::*;
 
     pub struct Singleton<S: ?Sized, T, I> {
-        endpoint: &'static str,
         pub singleton: std::rc::Rc<T>,
         p_service: std::marker::PhantomData<S>,
         p_session: std::marker::PhantomData<I>,
@@ -302,9 +340,8 @@ pub mod hosted {
         where S: ServiceContract + ?Sized + 'static,
               T: SingletonService<S> + 'static,
     {
-        pub fn new( singleton: T, endpoint: &'static str ) -> Self {
+        pub fn new( singleton: T ) -> Self {
             Singleton {
-                endpoint,
                 singleton: std::rc::Rc::new( singleton ),
                 p_service: std::marker::PhantomData,
                 p_session: std::marker::PhantomData,
@@ -319,14 +356,12 @@ pub mod hosted {
         type ServiceInstance = std::rc::Rc<T>;
         type SessionInfo = I;
 
-        fn endpoint(&self) -> &'static str { self.endpoint }
-        fn get_session( &self, session_info : Rc<I> ) -> Self::ServiceInstance {
+        fn get_session( &self, _ : Rc<I> ) -> Self::ServiceInstance {
             self.singleton.clone()
         }
     }
 
     pub struct Session<S: ?Sized, T> {
-        endpoint: &'static str,
         phantom_service: std::marker::PhantomData<S>,
         phantom_session: std::marker::PhantomData<T>,
     }
@@ -335,9 +370,8 @@ pub mod hosted {
         where S: ServiceContract + ?Sized + 'static,
               T: SessionService<S> + 'static,
     {
-        pub fn new( endpoint: &'static str ) -> Self {
+        pub fn new() -> Self {
             Session {
-                endpoint,
                 phantom_service: std::marker::PhantomData,
                 phantom_session: std::marker::PhantomData,
             }
@@ -351,7 +385,6 @@ pub mod hosted {
         type ServiceInstance = Box<S>;
         type SessionInfo = T::SessionInfo;
 
-        fn endpoint(&self) -> &'static str { self.endpoint }
         fn get_session( &self, session_info : Rc<T::SessionInfo> ) -> Self::ServiceInstance {
             T::construct( session_info )
         }
@@ -364,7 +397,6 @@ pub trait HostedService<S>
 {
     type ServiceInstance : InvokeTarget<S>;
     type SessionInfo;
-    fn endpoint(&self) -> &'static str;
     fn get_session( &self, session_info : Rc<Self::SessionInfo> ) -> Self::ServiceInstance;
 }
 
@@ -428,7 +460,7 @@ impl<A, B> InvokeTarget<A> for Box<B>
 /// serialize the params, which the service deserializes and so on.
 ///
 /// Defined by the concrete service host.
-pub trait Forwarder {
+pub trait Forwarder : 'static {
 
     fn forward<D, S>(
         &self,
@@ -449,6 +481,9 @@ pub struct ServiceProxy<S: ?Sized, F>
     pub forwarder: F,
     phantom_data: std::marker::PhantomData<S>,
 }
+
+unsafe impl<S: ?Sized, F> Send for ServiceProxy<S, F> {}
+unsafe impl<S: ?Sized, F> Sync for ServiceProxy<S, F> {}
 
 impl<S: ?Sized, F: Forwarder> ServiceProxy<S, F> {
     pub fn new( f: F ) -> ServiceProxy<S, F> {

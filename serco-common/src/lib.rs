@@ -19,6 +19,8 @@ pub enum ServiceContractError {
 #[derive(Debug, PartialEq)]
 pub struct ServiceContractModel {
     pub name: Ident,
+    pub callback_interface: Type,
+    pub mod_ident: Ident,
     pub operations : Vec<Operation>
 }
 
@@ -52,14 +54,20 @@ pub struct ServiceModel {
 impl ServiceContractModel {
 
     pub fn try_from(
+        attribute : TokenStream,
         tokens : TokenStream
     ) -> Result<ServiceContractModel, ServiceContractError>
     {
+        let args : ServiceContractAttributeArgs = syn::parse2( attribute )
+                .map_err( |_| ServiceContractError::BadItem )?;
         let input : ItemTrait = syn::parse2( tokens )
                 .map_err( |_| ServiceContractError::BadItem )?;
+        let mod_ident = Ident::from( format!( "{}_impl_mod", input.ident ) );
 
         Ok( ServiceContractModel {
             name: input.ident,
+            mod_ident: mod_ident,
+            callback_interface: args.callback_interface,
             operations: input.items.into_iter().filter_map( |i|
                     match i {
                         TraitItem::Method( tim ) => Some( tim ),
@@ -143,6 +151,69 @@ impl ServiceModel {
     }
 }
 
+struct ServiceContractAttributeArgs {
+    callback_interface: Type,
+}
+
+impl synom::Synom for ServiceContractAttributeArgs {
+    named!(parse -> Self, 
+        map!(
+            option!( map!(
+                parens!( punctuated::Punctuated
+                             ::<ServiceContractAttributeArg, Token![,]>
+                             ::parse_terminated_nonempty ),
+                |(_, args)| ServiceContractAttributeArgs::from( args )
+            ) ),
+            |opt| opt.unwrap_or_else( || Default::default() )
+        )
+    );
+}
+
+enum ServiceContractAttributeArg {
+    Callback( Type )
+}
+
+impl Default for ServiceContractAttributeArgs {
+    fn default() -> Self {
+        ServiceContractAttributeArgs {
+            callback_interface: parse_quote!( () )
+        }
+    }
+}
+
+impl<I> From<I> for ServiceContractAttributeArgs
+    where I: IntoIterator<Item=ServiceContractAttributeArg>
+{
+    fn from( src: I ) -> Self {
+        let mut result : Self = Default::default();
+        
+        use ServiceContractAttributeArg::*;
+        for arg in src {
+            match arg {
+                Callback( t ) => result.callback_interface = t,
+            }
+        }
+
+        result
+    }
+}
+
+impl synom::Synom for ServiceContractAttributeArg {
+    named!(parse -> Self, do_parse!(
+            name: syn!(Ident) >>
+            punct!(=) >>
+            arg: switch!( value!( name.as_ref() ),
+                "callback" => map!(
+                    syn!(Type),
+                    ServiceContractAttributeArg::Callback
+                )
+                |
+                _ => reject!()
+            ) >>
+            ( arg )
+    ) );
+}
+
 struct ServiceAttributeArgs {
     services: HashSet<Ident>,
 }
@@ -184,6 +255,7 @@ mod test {
 
         assert_eq!( model, ServiceModel {
             name: Ident::from( "Singleton" ),
+            mod_ident: Ident::from( "Singleton_impl_mod" ),
             has_session: false,
             services: HashSet::from_iter( vec![
                 Ident::from( "SomeService" )
@@ -200,6 +272,7 @@ mod test {
 
         assert_eq!( model, ServiceModel {
             name: Ident::from( "Session" ),
+            mod_ident: Ident::from( "Session_impl_mod" ),
             has_session: true,
             services: HashSet::from_iter( vec![
                 Ident::from( "SessionService" )
@@ -216,6 +289,7 @@ mod test {
 
         assert_eq!( model, ServiceModel {
             name: Ident::from( "Services" ),
+            mod_ident: Ident::from( "Services_impl_mod" ),
             has_session: false,
             services: HashSet::from_iter( vec![
                 Ident::from( "A" ),
@@ -229,6 +303,7 @@ mod test {
     #[test]
     pub fn service_contract() {
         let model = ServiceContractModel::try_from(
+            quote!().into(),
             quote!( trait SomeContract {
                 fn op_1( &self, a: u32, b: bool ) -> String;
                 fn op_2( &self, something: String );
@@ -237,6 +312,8 @@ mod test {
 
         assert_eq!( model, ServiceContractModel {
             name: Ident::from( "SomeContract" ),
+            mod_ident: Ident::from( "SomeContract_impl_mod" ),
+            callback_interface: parse_quote!( () ),
             operations: vec![
                 Operation {
                     name: Ident::from( "op_1" ),
@@ -263,6 +340,23 @@ mod test {
                     ],
                 },
             ],
+        } );
+    }
+
+    #[test]
+    pub fn callback_interface() {
+        let model = ServiceContractModel::try_from(
+            quote!(
+                ( callback = CallbackItf )
+            ).into(),
+            quote!( trait SomeContract {} ).into()
+        ).unwrap();
+
+        assert_eq!( model, ServiceContractModel {
+            name: Ident::from( "SomeContract" ),
+            mod_ident: Ident::from( "SomeContract_impl_mod" ),
+            callback_interface: parse_quote!( CallbackItf ),
+            operations: vec![]
         } );
     }
 }

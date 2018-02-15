@@ -2,7 +2,7 @@
 
 use std::thread;
 
-extern crate futures;
+#[macro_use] extern crate futures;
 use futures::prelude::*;
 extern crate tokio_core;
 use tokio_core::reactor::Core;
@@ -23,6 +23,16 @@ use serco_mpsc::*;
 pub trait MyService {
     fn name( &self ) -> String;
     fn foo( &self, a : i32 ) -> bool;
+}
+
+#[service_contract( callback = CallbackContract )]
+pub trait CallbackService {
+    fn serve( &self ) -> String;
+}
+
+#[service_contract]
+pub trait CallbackContract {
+    fn callback( &self ) -> String;
 }
 
 #[service(MyService)]
@@ -51,6 +61,27 @@ impl MyService for SessionImplementation {
     fn foo( &self, a : i32 ) -> bool {
         self.session.value.set( a );
         true
+    }
+}
+
+use serco::ServiceContract;
+
+#[service(CallbackService)]
+struct MyCallbackService;
+impl CallbackService for MyCallbackService {
+    fn serve( &self ) -> String {
+
+        let cb = CallbackService::get_callback();
+        let s = cb.callback();
+        format!( "< {} >", s )
+    }
+}
+
+#[service(CallbackContract)]
+struct MyCallback;
+impl CallbackContract for MyCallback{
+    fn callback( &self ) -> String {
+        String::from( "Callback" )
     }
 }
 
@@ -102,15 +133,6 @@ fn main() {
 
     thread::spawn( move || {
 
-        let host = serco::ServiceHost2::new( MyService::singleton( MyServiceImplementation( "u" ), "unique" ) )
-                            .endpoint( MpscEndpoint::new( "test" ) )
-                            .run();
-
-        let host = serco::ServiceHost2::new( MyService::singleton( MyServiceImplementation( "u" ), "unique" ) )
-                            .session_factory( MySessionFactory )
-                            .endpoint( MpscEndpoint::new( "test" ) )
-                            .run();
-
         let host = serco::ServiceHost2::new( MyService::session::<SessionImplementation>( "unique" ) )
                             .session_factory( ComplexSessionFactory )
                             .endpoint( MpscEndpoint::new( "test" ) )
@@ -125,25 +147,48 @@ fn main() {
         core.run( host ).unwrap();
     } );
 
+    thread::spawn( move || {
+
+        let host = serco::ServiceHost2::new( CallbackService::singleton( MyCallbackService, "unique" ) )
+                            .endpoint( MpscEndpoint::new( "callback" ) )
+                            .run();
+
+        let mut core = Core::new().expect( "Failed to create core" );
+        core.run( host ).unwrap();
+    } );
+
     // Allow the service to start.
     thread::sleep( std::time::Duration::from_millis( 10 ) );
+    let mut core = Core::new().expect( "Failed to create core" );
 
     // Connect to the service.
-    MpscClient::new( "test" ).connect::<MyService>( "singleton" ).map( |conn| {
+    let handle = core.handle();
+    core.run( MpscClient::new( "test", handle ).connect::<MyService>().map( |conn| {
 
         // Call the service.
         println!( "{}", conn.name() );
         println!( "{}", conn.foo( 3 ) );
 
-    } ).wait().unwrap();
+    } ) ).unwrap();
 
     // Connect to the service.
-    MpscClient::new( "test" ).connect::<MyService>( "unique" ).map( |conn| {
+    let handle = core.handle();
+    core.run( MpscClient::new( "test", handle ).connect::<MyService>().map( |conn| {
 
         // Call the service.
         println!( "{}", conn.name() );
         println!( "{}", conn.foo( 4 ) );
         println!( "{}", conn.name() );
 
-    } ).wait().unwrap();
+    } ) ).unwrap();
+
+    // Connect to the service.
+    let callback : MyCallback = MyCallback;
+    let handle = core.handle();
+    core.run( MpscClient::new( "callback", handle ).connect_duplex::<CallbackService, _, _>( callback ).map( |conn| {
+
+        // Call the service.
+        println!( "{}", conn.serve() );
+
+    } ) ).unwrap();
 }
